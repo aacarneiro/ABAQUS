@@ -1,0 +1,616 @@
+C
+C     Modified UEL for cohesive elements to represent the interface between fibers
+C   and epoxy. UMAT for epoxy (mises + damage, with element deletion with SDV 11)
+C
+C     ABAQUS user subroutine for a 2D cohesive zone model, based on the paper by
+C		Y.F. Gao and A.F. Bower, "A simple technique for avoiding convergence
+C		problems in finite element simulations of crack nucleation and growth on
+C		cohesive interfaces," Modelling Simul. Mater. Sci. Eng. 12, 453-463, 2004.
+C
+C	The Fortran code and the user's manual are last modified on December 9, 2004.
+C
+C		Y.F. Gao & A.F. Bower, Divsion of Engineering, Brown University
+C
+C=========================== SUBROUTINE UEL ===================
+C
+      SUBROUTINE UEL(RHS,STIF,SVARS,ENERGY,NDOFEL,NRHS,NSVARS,
+     &       PROPS,NPROPS,COORDS,MCRD,NNODE,U,DU,V,A,JTYPE,TIME,DTIME,
+     &       KSTEP,KINC,JELEM,PARAMS,NDLOAD,JDLTYP,ADLMAG,PREDEF,NPREDF,
+     &       LFLAGS,MLVARX,DDLMAG,MDLOAD,PNEWDT,JPROPS,NJPROP,PERIOD)
+C
+C     INCLUDE 'ABA_PARAM.INC'
+      IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+
+      DIMENSION RHS(MLVARX,*),STIF(NDOFEL,NDOFEL),PROPS(*)
+      DIMENSION SVARS(*),ENERGY(8),COORDS(MCRD,NNODE),U(NDOFEL)
+      DIMENSION DU(MLVARX,*),V(NDOFEL),A(NDOFEL),TIME(2),PARAMS(*)
+      DIMENSION JDLTYP(MDLOAD,*),ADLMAG(MDLOAD,*),DDLMAG(MDLOAD,*)
+      DIMENSION PREDEF(2,NPREDF,NNODE),LFLAGS(*),JPROPS(*)
+C
+C     Only relevant variables are commented. Refer to ABAQUS manual for others.
+C
+C     Variables with intent(out)
+C     RHS         Residual Vector
+C     STIF        Stiffness matrix
+C
+C     Variables with intent(in)
+C     PROPS       Element property array for the Xu-Needleman model
+C                 PROPS(1)    SIGMA_max
+C                 PROPS(2)    Delta_n
+C                 PROPS(3)    Delta_t
+C                 PROPS(4)    Q
+C     COORDS      Nodal coordinate array: COORD(J,N) is jth coord of nth node
+C     U           Total accumulated DOF array.  Contains accumulated displacements,
+C                 ordered as (u_i^1, u_i^2)
+C     DU          Incremental displacements, ordered as
+C                 DU(2*(N-1)+I,1) = u_i^n
+C
+C     NNODE       No. nodes on element.
+C     NDOFEL      No. degrees of freedom for element
+C     NPROPS      No. real valued element properties
+C     MLVARX      Dimensioning variable.
+C     NRHS        No. RHS vectors.
+C     MCRD        Largest of max value of COORDINATES parameter or active DOF <3.
+C
+C	NNODE=4		Four-point element (4,3 should collapse onto 1,2 respectively)
+C
+C				4----3
+C				|	 |
+C				1----2
+C
+C	NDOFEL=8	Two-dimensional, d.o.f=4*2
+C	NPROPS=5	Five parameters passed in
+C	MLVARX=1
+C	NRHS=1
+C   MCRD=2		(X,Y)
+C
+      DIMENSION W(4),PQ(4)
+      DIMENSION F(10),DF(10)
+      DIMENSION GAP(2),TRACT(2),DTDG(2,2)
+      DIMENSION RNM(2),TANGENT(2),UREL(2)
+      DIMENSION VGAP(2),VREL(2)
+      
+C      I_SV_status = 0
+      NINTP=2
+C
+C	The above arrays are used inside the subroutine
+C	NINTP		No. integration points
+C	PQ(NINTP)	Local coordinates of integration points
+C	W(NINTP)	Weights of integration points
+C	F(NNODE)	Shape function
+C	DF(NNODE)	Derivative of shape function w.r.t local coordinate
+C
+
+       DO  I = 1,NDOFEL
+         RHS(I,1)=0.D0
+         DO  J = 1,NDOFEL
+           STIF(J,I) = 0.D0
+         END DO
+       END DO
+C
+C      Set up integration points and weights
+       CALL KINTPT(PQ,W,NNODE,NINTP)
+C
+       DO I=1,NINTP
+C
+C        Shape functions and derivatives
+         CALL KSHAPE(NNODE,PQ(I),F)
+         CALL DSHAPE(NNODE,PQ(I),DF)
+C
+C        Compute Normal and tangent vectors to boundary at int pt.
+C        Plane of interface defined as average of upper and lower
+C        surfaces (hopefully coincident, but you never know...)
+
+        TANGENT(1)=.5D0*(COORDS(1,2)-COORDS(1,1)
+     &					+COORDS(1,3)-COORDS(1,4))
+        TANGENT(2)=.5D0*(COORDS(2,2)-COORDS(2,1)
+     &					+COORDS(2,3)-COORDS(2,4))
+	
+        CALL KUNITV(TANGENT,DET)
+        DET=.5D0*DET
+
+        RNM(1)=-TANGENT(2)
+        RNM(2)=TANGENT(1)
+C
+C        Relative displacement, in global coords
+         UREL(1) = 0.D0
+         UREL(2) = 0.D0
+       VREL(1)=0.D0
+       VREL(2)=0.D0
+         DO N = 1,NNODE/2
+           N2 = N+NNODE/2
+	     DO J = 1,2
+           UREL(J) = UREL(J) + F(N2)*(U(2*(N2-1)+J)) 
+     &                       - F(N)*(U(2*(N-1)+J)) 
+           VREL(J) = VREL(J) + F(N2)*(V(2*(N2-1)+J)) 
+     &                       - F(N)*(V(2*(N-1)+J)) 
+	     END DO
+         END DO
+
+C
+C        GAP(1) is normal separation, GAP(2) is separation in tan dirn
+         GAP(1) =  RNM(1)*UREL(1)+RNM(2)*UREL(2)
+         GAP(2) =  TANGENT(1)*UREL(1)+TANGENT(2)*UREL(2)
+         VGAP(1)=  RNM(1)*VREL(1)+RNM(2)*VREL(2)
+         VGAP(2)=  TANGENT(1)*VREL(1)+TANGENT(2)*VREL(2)
+C
+         CALL SEPLAW(PROPS,GAP,VGAP,TRACT,DTDG,DTIME,I_SV_status)
+C
+         SIG = 1.D0
+        DO N = 1,NNODE
+	     IF (N.GT.NNODE/2) SIG = -1.D0
+	     DO K = 1,2
+             RHS(2*(N-1)+K,1) = RHS(2*(N-1)+K,1) 
+     &          + SIG*F(N)*( TRACT(1)*RNM(K)
+     &          +            TRACT(2)*TANGENT(K))*W(I)*DET
+	     END DO
+        END DO
+
+
+         SIGN = 1.D0
+         DO N = 1,NNODE
+	     IF (N.GT.NNODE/2) SIGN = -1.D0
+	     SIGM = 1.D0
+	     DO M=1,NNODE
+	       IF (M.GT.NNODE/2) SIGM = -1.D0
+	       DO KN = 1,2
+	       DO KM = 1,2
+	       ICOL = 2*(M-1) + KM
+	       IROW = 2*(N-1) + KN
+C
+             STIF(ICOL,IROW) = STIF(ICOL,IROW)
+     &         +( (DTDG(1,1)*RNM(KN)+DTDG(2,1)*TANGENT(KN))*RNM(KM) 
+     &         +(DTDG(1,2)*RNM(KN)+DTDG(2,2)*TANGENT(KN))*TANGENT(KM) )
+     &              *SIGM*SIGN*F(M)*F(N)*W(I)*DET
+             END DO
+	       END DO
+
+C
+           END DO
+         END DO
+C
+       END DO
+	   
+C      SVARS(2) = I_SV_status;
+C
+C      if (SVARS(2) .EQ. 1) then
+C       STIF = 0;
+C      end if
+
+       RETURN
+       END
+C
+C===================== SUBROUTINE SEPLAW =====================
+C
+      SUBROUTINE SEPLAW(PROPS,GAP,VGAP,TRACT,DTDGAP,DTIME)
+C
+      IMPLICIT DOUBLE PRECISION (A-H,O-Z)
+C
+      DIMENSION PROPS(4)
+      DIMENSION GAP(2),VGAP(2),TRACT(2),DTDGAP(2,2)
+C
+C     Subroutine to specify traction-separation law for 
+C     a debonding interface.
+C
+C     Currently coded for Xu-Needleman constitutive law, i.e.
+C		X.P. Xu and A. Needleman, J. Mech. Phys. Solids, 42, 1397-1434.
+C
+C     PROPS(1)    PHI_N
+C     PROPS(2)    PHI_T
+C     PROPS(3)    SIGMA_MAX
+C     PROPS(4)    TAU_MAX
+C
+C     GAP(1)      Normal separation
+C     GAP(2)      Tangential separation
+C     TRACT(1)    Normal traction
+C     TRACT(2)    Tangential traction
+C     
+C
+C --  Work of separation
+      PHI_N = PROPS(1)
+      PHI_T = PROPS(2)
+      SIGMA_MAX = PROPS(3)
+      TAU_MAX = PROPS(4)
+      SEPWRK = PROPS(1)
+      DN = PHI_N/(SIGMA_MAX*EXP(1.D0))
+      DT = PHI_T/(TAU_MAX*SQRT(EXP(1.D0)/2))
+	  
+C      test = 1-EXP(-GAP(1)/DN)*(1+GAP(1)/DN)*EXP(-GAP(2)*GAP(2)/(DT*DT))
+C
+C
+      if (GAP(1) .LT. 12*DN .AND. GAP(2) .LT. 4*DT) then
+        C1 = (GAP(1)/DN)*(DEXP(-GAP(2)*GAP(2)/(DT*DT)))
+        C1 = C1 * DEXP(-GAP(1)/DN)
+        TRACT(1) = (PHI_N/DN)*C1
+C
+        C1 = DEXP(-GAP(2)*GAP(2)/(DT*DT))*DEXP(-GAP(1)/DN)
+        C2 = 2.D0*GAP(2)/(DT*DT)*(1+GAP(1)/DN)
+        TRACT(2) = PHI_N*C1*C2
+C
+        C1 = (DEXP(-GAP(2)*GAP(2)/(DT*DT)))
+        C1 = C1*DEXP(-GAP(1)/DN)*(1-GAP(1)/DN)
+        DTDGAP(1,1) = (PHI_N/(DN*DN))*C1
+C
+        C1 = DEXP(-GAP(2)*GAP(2)/(DT*DT))*DEXP(-GAP(1)/DN)
+        C1 = C1*(1+GAP(1)/DN)*(1-2.D0*GAP(2)*GAP(2)/(DT*DT))
+        DTDGAP(2,2) = C1*(2.D0*PHI_N/(DT*DT))
+C
+        C1 = DEXP(-GAP(2)*GAP(2)/(DT*DT))*DEXP(-GAP(1)/DN)
+        C1 = C1*(-GAP(1)*GAP(2))/(DT*DT*DN*DN)
+        DTDGAP(1,2) = C1*(2.D0*PHI_N)
+        DTDGAP(2,1) = DTDGAP(1,2)
+C
+C	ZETA is the fictitious viscosity used to regularize the instability
+C		problem. In our papere, \zeta_n is ZETA*PROPS(1) here. Simply
+C		setting ZETA=0.D0 (or delete the following three lines
+C		gives the standard Xu-Needleman model.
+C      ZETA=0.0001D0
+C      TRACT(1)=TRACT(1)+ZETA*PROPS(1)*VGAP(1)/DN
+C      DTDGAP(1,1)=DTDGAP(1,1)+ZETA*PROPS(1)/DN/DTIME
+C
+      else
+C	  
+C	   Complete failure condition
+C
+       TRACT(1) = 0.D0
+       TRACT(2) = 0.D0
+      end if
+C	  
+
+
+      RETURN
+      END
+C
+C
+C========================== SUBROUTINE INTPTS =================================
+C
+       SUBROUTINE KINTPT(PQ,W,KNODE,NINTP)
+       IMPLICIT DOUBLE PRECISION(A-H,O-Z)
+C
+       DIMENSION PQ(*),W(*)
+C
+C      Subroutine to initialize integration points PQ and weights W
+C      NINTP = No. integration points (DEFAULT=2)
+C      KNODE = No. of nodes on element (DEFAULT=4)
+C
+C      Integration points for 2D interface elements
+C
+C				4----3
+C				|	 |
+C				|	 |
+C				1----2
+c
+      IF (NINTP.EQ.2) THEN
+		CN=0.5773502691896260D0
+		PQ(1)=-CN
+		PQ(2)=CN
+		W(1)=1.D0
+		W(2)=1.D0
+      ENDIF
+
+C
+       RETURN
+       END
+C
+C=========================== SUBROUTINE SHAPE ===============================
+C
+       SUBROUTINE KSHAPE(KNODE,PQ,F)
+       IMPLICIT DOUBLE PRECISION(A-H,O-Z)
+C
+       DIMENSION F(*)
+C
+C  
+      IF(KNODE.EQ.4) THEN
+        F(1)=.5D0*(1-PQ)
+        F(2)=.5D0*(1+PQ)
+        F(3)=F(2)
+        F(4)=F(1)
+      ENDIF
+
+       RETURN
+       END
+C
+C============================== SUBROUTINE DSHAPE ====================
+C
+       SUBROUTINE DSHAPE(KNODE,PQ,DF)
+       IMPLICIT DOUBLE PRECISION(A-H,O-Z)
+C
+       DIMENSION DF(*)
+C
+C
+      IF(KNODE.EQ.4) THEN
+		DF(1)=-.5D0
+		DF(2)=.5D0
+		DF(3)=DF(2)
+		DF(4)=DF(1)
+      ENDIF
+
+       RETURN
+       END
+C
+C========================== SUBROUTINE KUNITV ===================
+C
+       SUBROUTINE KUNITV(A,AMAG)
+       DOUBLE PRECISION A(2), AMAG
+C
+C     Normalize vector A and return its magnitude as AMAG
+C
+
+      AMAG = DSQRT(A(1)*A(1)+A(2)*A(2))
+      A(1) = A(1)/AMAG
+      A(2) = A(2)/AMAG
+C
+       RETURN
+       END
+
+
+
+
+
+C ----------------------------------------------------------------
+C ----------------------------------------------------------------
+C ----------------------------------------------------------------
+
+
+
+
+
+
+      SUBROUTINE UMAT(STRESS, STATEV, DDSDDE, SSE, SPD, SCD, RPL,
+     1 DDSDDT, DRPLDE, DRPLDT, STRAN, DSTRAN, TIME, DTIME, TEMP, DTEMP,
+     2 PREDEF, DPRED, CMNAME, NDI, NSHR, NTENS, NSTATV, PROPS, NPROPS,
+     3 COORDS, DROT, PNEWDT, CELENT, DFGRD0, DFGRD1, NOEL, NPT, LAYER,
+     4 KSPT, KSTEP, KINC)
+C
+      INCLUDE 'ABA_PARAM.INC'
+C
+      CHARACTER*8 CMNAME
+C
+      DIMENSION STRESS(NTENS), STATEV(NSTATV), DDSDDE(NTENS, NTENS),
+     1 DDSDDT(NTENS), DRPLDE(NTENS), STRAN(NTENS), DSTRAN(NTENS),
+     2 PREDEF(1), DPRED(1), PROPS(NPROPS), COORDS(3), DROT(3, 3),
+     3 DFGRD0(3, 3), DFGRD1(3, 3)
+
+C LOCAL ARRAYS
+C ----------------------------------------------------------------
+C EELAS - ELASTIC STRAINS
+C EPLAS - PLASTIC STRAINS
+C FLOW - DIRECTION OF PLASTIC FLOW
+C ----------------------------------------------------------------
+C
+      DIMENSION EELAS(6),EPLAS(6),FLOW(6), HARD(3)
+C
+      PARAMETER(ZERO=0.D0, ONE=1.D0, TWO=2.D0, THREE=3.D0, SIX=6.D0,
+     & ENUMAX=.4999D0, NEWTON=10, TOLER=1.0D-6, FOUR=4.D0)
+C
+C ----------------------------------------------------------------
+C UMAT FOR ISOTROPIC ELASTICITY AND ISOTROPIC MISES PLASTICITY
+C CANNOT BE USED FOR PLANE STRESS
+C ----------------------------------------------------------------
+C PROPS(1) - E
+C PROPS(2) - NU
+C PROPS(3..) - SYIELD AN HARDENING DATA
+C CALLS UHARD FOR CURVE OF YIELD STRESS VS. PLASTIC STRAIN
+C ----------------------------------------------------------------
+C
+C ELASTIC PROPERTIES
+C
+
+      IF (KINC .EQ. 1) THEN
+         STATEV(11) = ONE
+      ENDIF
+	  
+C      if (STATEV(11) .EQ. ONE) then
+
+      DAMAGE = STATEV(10)
+      EMOD0=PROPS(1)
+      EMOD = EMOD0*(1-DAMAGE)
+      ENU=MIN(PROPS(2), ENUMAX)
+      EBULK3=EMOD/(ONE-TWO*ENU)
+      EG2=EMOD/(ONE+ENU)
+      EG=EG2/TWO
+      EG3=THREE*EG
+      ELAM=(EBULK3-EG2)/THREE
+C
+C ELASTIC STIFFNESS
+C
+      DO K1=1, NDI
+        DO K2=1, NDI
+          DDSDDE(K2, K1)=ELAM
+          END DO
+        DDSDDE(K1, K1)=EG2+ELAM
+      END DO
+      DO K1=NDI+1, NTENS
+        DDSDDE(K1, K1)=EG
+      END DO
+C RECOVER ELASTIC AND PLASTIC STRAINS AND ROTATE FORWARD
+C ALSO RECOVER EQUIVALENT PLASTIC STRAIN
+C
+      CALL ROTSIG(STATEV( 1), DROT, EELAS, 2, NDI, NSHR)
+      CALL ROTSIG(STATEV(NTENS+1), DROT, EPLAS, 2, NDI, NSHR)
+      EQPLAS=STATEV(1+2*NTENS)
+C
+C CALCULATE PREDICTOR STRESS AND ELASTIC STRAIN
+C
+      DO K1=1, NTENS
+        DO K2=1, NTENS
+          STRESS(K2)=STRESS(K2)+DDSDDE(K2, K1)*DSTRAN(K1)
+        END DO
+        EELAS(K1)=EELAS(K1)+DSTRAN(K1)
+      END DO
+C
+C CALCULATE EQUIVALENT VON MISES STRESS
+C
+      SMISES=(STRESS(1)-STRESS(2))**2+(STRESS(2)-STRESS(3))**2
+     & +(STRESS(3)-STRESS(1))**2
+      DO K1=NDI+1,NTENS
+      SMISES=SMISES+SIX*STRESS(K1)**2
+      END DO
+      SMISES=SQRT(SMISES/TWO)
+C
+C GET YIELD STRESS FROM THE SPECIFIED HARDENING CURVE
+C
+      NVALUE=NPROPS/2-1
+      CALL UHARD(SYIEL0, HARD, EQPLAS, EQPLASRT,TIME,DTIME,TEMP,
+     & DTEMP,NOEL,NPT,LAYER,KSPT,KSTEP,KINC,CMNAME,NSTATV,
+     & STATEV,NUMFIELDV,PREDEF,DPRED,NVALUE,PROPS(3))
+C
+C DETERMINE IF ACTIVELY YIELDING
+C
+      IF (SMISES.GT.(ONE+TOLER)*SYIEL0) THEN
+C
+C ACTIVELY YIELDING
+C SEPARATE THE HYDROSTATIC FROM THE DEVIATORIC STRESS
+C CALCULATE THE FLOW DIRECTION
+C
+       SHYDRO=(STRESS(1)+STRESS(2)+STRESS(3))/THREE
+       DO K1=1,NDI
+        FLOW(K1)=(STRESS(K1)-SHYDRO)/SMISES
+       END DO
+       DO K1=NDI+1, NTENS
+        FLOW(K1)=STRESS(K1)/SMISES
+       END DO
+C
+C SOLVE FOR EQUIVALENT VON MISES STRESS
+C AND EQUIVALENT PLASTIC STRAIN INCREMENT USING NEWTON ITERATION
+C
+       SYIELD=SYIEL0
+       DEQPL=ZERO
+       DO KEWTON=1, NEWTON
+        RHS=SMISES-EG3*DEQPL-SYIELD
+        DEQPL=DEQPL+RHS/(EG3+HARD(1))
+        CALL UHARD(SYIELD,HARD,EQPLAS+DEQPL,EQPLASRT,TIME,DTIME,TEMP,
+     &   DTEMP,NOEL,NPT,LAYER,KSPT,KSTEP,KINC,CMNAME,NSTATV,
+     &   STATEV,NUMFIELDV,PREDEF,DPRED,NVALUE,PROPS(3))
+         IF(ABS(RHS).LT.TOLER*SYIEL0) GOTO 10
+       END DO
+C
+C WRITE WARNING MESSAGE TO THE .MSG FILE
+C
+C      WRITE(7,2) NEWTON
+C     2 FORMAT('  ',30X,'***WARNING - PLASTICITY ALGORITHM DID NOT ',
+C     1 'CONVERGE AFTER ’,I3,’ ITERATIONS')
+10    CONTINUE
+C
+C UPDATE STRESS, ELASTIC AND PLASTIC STRAINS AND
+C EQUIVALENT PLASTIC STRAIN
+C
+      DO K1=1,NDI
+       STRESS(K1)=FLOW(K1)*SYIELD+SHYDRO
+       EPLAS(K1)=EPLAS(K1)+THREE/TWO*FLOW(K1)*DEQPL
+       EELAS(K1)=EELAS(K1)-THREE/TWO*FLOW(K1)*DEQPL
+      END DO
+      DO K1=NDI+1,NTENS
+       STRESS(K1)=FLOW(K1)*SYIELD
+       EPLAS(K1)=EPLAS(K1)+THREE*FLOW(K1)*DEQPL
+       EELAS(K1)=EELAS(K1)-THREE*FLOW(K1)*DEQPL
+      END DO
+      EQPLAS=EQPLAS+DEQPL
+C
+C CALCULATE PLASTIC DISSIPATION
+C
+      SPD=DEQPL*(SYIEL0+SYIELD)/TWO
+C
+C FORMULATE THE JACOBIAN (MATERIAL TANGENT)
+C FIRST CALCULATE EFFECTIVE MODULI
+C
+      EFFG=EG*SYIELD/SMISES
+      EFFG2=TWO*EFFG
+      EFFG3=THREE/TWO*EFFG2
+      EFFLAM=(EBULK3-EFFG2)/THREE
+      EFFHRD=EG3*HARD(1)/(EG3+HARD(1))-EFFG3
+       DO K1=1, NDI
+         DO K2=1, NDI
+         DDSDDE(K2, K1)=EFFLAM
+         END DO
+         DDSDDE(K1, K1)=EFFG2+EFFLAM
+       END DO
+       DO K1=NDI+1, NTENS
+         DDSDDE(K1, K1)=EFFG
+       END DO
+       DO K1=1, NTENS
+         DO K2=1, NTENS
+           DDSDDE(K2, K1)=DDSDDE(K2, K1)+EFFHRD*FLOW(K2)*FLOW(K1)
+         END DO
+       END DO
+      ENDIF
+C
+C STORE ELASTIC AND (EQUIVALENT) PLASTIC STRAINS
+C IN STATE VARIABLE ARRAY
+C
+      DO K1=1, NTENS
+       STATEV(K1)=EELAS(K1)
+       STATEV(K1+NTENS)=EPLAS(K1)
+      END DO
+      STATEV(1+2*NTENS)=EQPLAS
+C
+C
+      DAM = ZERO
+      IF (SMISES .GT. (ONE-TOLER)*SYIEL0) THEN
+         DAM = 0.9*(SMISES - 24.0)/46.0
+
+      END IF
+
+      IF (DAM .GT. (ONE-TOLER)*0.9) THEN
+           STATEV(11) = ZERO
+           DAM = 0.9
+      ENDIF
+	  
+      IF (DAM .GT. STATEV(10)) THEN
+         STATEV(10) = DAM
+      ENDIF
+	  	  
+C      end if
+	  
+      RETURN
+      END
+	  
+*********************************************
+	  
+      SUBROUTINE UHARD(SYIELD,HARD,EQPLAS,EQPLASRT,TIME,DTIME,TEMP,
+     1 DTEMP,NOEL,NPT,LAYER,KSPT,KSTEP,KINC,
+     2 CMNAME,NSTATV,STATEV,NUMFIELDV,
+     3 PREDEF,DPRED,NVALUE,TABLE)
+      INCLUDE 'ABA_PARAM.INC'
+      CHARACTER*80 CMNAME
+      DIMENSION HARD(3),STATEV(NSTATV),TIME(*),
+     1 PREDEF(NUMFIELDV),DPRED(*)
+C
+      DIMENSION TABLE(2, NVALUE)
+C
+      PARAMETER(ZERO=0.D0)
+C
+C SET YIELD STRESS TO LAST VALUE OF TABLE, HARDENING TO ZERO
+C
+      SYIELD=TABLE(1, NVALUE)
+      HARD(1)=ZERO
+C IF MORE THAN ONE ENTRY, SEARCH TABLE
+C
+      IF(NVALUE.GT.1) THEN
+       DO K1=1, NVALUE-1
+        EQPL1=TABLE(2,K1+1)
+        IF(EQPLAS.LT.EQPL1) THEN
+         EQPL0=TABLE(2, K1)
+          IF(EQPL1.LE.EQPL0) THEN
+C          WRITE(7, 1)
+C     1    FORMAT(' ', 30X, '***ERROR - PLASTIC STRAIN MUST BE ',
+C     1    'ENTERED IN ASCENDING ORDER')
+          CALL XIT
+      ENDIF
+C
+C CURRENT YIELD STRESS AND HARDENING
+C
+           DEQPL=EQPL1-EQPL0
+           SYIEL0=TABLE(1, K1)
+           SYIEL1=TABLE(1, K1+1)
+           DSYIEL=SYIEL1-SYIEL0
+           HARD(1)=DSYIEL/DEQPL
+           SYIELD=SYIEL0+(EQPLAS-EQPL0)*HARD(1)
+		   
+           GOTO 10
+          ENDIF
+       END DO
+10    CONTINUE
+      ENDIF
+      RETURN
+      END
