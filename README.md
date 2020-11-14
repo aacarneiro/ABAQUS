@@ -1,5 +1,3 @@
 # ABAQUS
 
-Some subroutines i'm working on.
-
-write info later
+User defined material for a CFRP machining simulation.
